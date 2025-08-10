@@ -1,0 +1,834 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Parallel Kingdom (WebSim Reconstruction)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Leaflet -->
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
+
+    <!-- React 18 + Babel (per websim docs) -->
+    <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js"></script>
+
+    <!-- Import map (example if we add more ESM libs later) -->
+    <script type="importmap">
+      {
+        "imports": {}
+      }
+    </script>
+
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+      const { useEffect, useRef, useState, useMemo } = React;
+
+      // ------------------------------
+      // Game Config (from spec)
+      // ------------------------------
+      const GAME = {
+        title: "Parallel Kingdom (WebSim Reconstruction)",
+        map: {
+          minZoom: 4,
+          maxZoom: 18,
+          defaultZoom: 15,
+          interactionRadiusMeters: 50,
+          gridCellSizeMeters: 10
+        },
+        player: {
+          baseStats: { level: 1, xp: 0, maxHP: 100, attack: 10, defense: 5, speed: 1.0 },
+          inventory: { capacity: 50, stackLimitPerItem: 99 },
+          desktopJump: { cost: { food: 5 }, cooldownSec: 15 }
+        },
+        resources: [
+          { id: "wood", source: "tree", respawnMinutes: 30, gatherXP: 5 },
+          { id: "stone", source: "rock", respawnMinutes: 45, gatherXP: 6 },
+          { id: "ore", source: "oreVein", respawnMinutes: 60, gatherXP: 8 },
+          { id: "herb", source: "plant", respawnMinutes: 20, gatherXP: 4 }
+        ],
+        monsters: [
+          { id: "wolf", hp: 50, attack: 8, xp: 15, aggressionRangeMeters: 20 },
+          { id: "bear", hp: 120, attack: 15, xp: 30, aggressionRangeMeters: 25 },
+          { id: "goblin", hp: 70, attack: 10, xp: 20, aggressionRangeMeters: 30 }
+        ],
+        combat: { roundTimeSeconds: 3, critPercent: 5 }
+      };
+
+      // ------------------------------
+      // Utilities
+      // ------------------------------
+      const metersPerDegLat = 111320;
+      function metersPerDegLon(lat) {
+        return 111320 * Math.cos((lat * Math.PI) / 180);
+      }
+      function snapToGrid(lat, lng, gridMeters = 10) {
+        const dLat = gridMeters / metersPerDegLat;
+        const dLng = gridMeters / metersPerDegLon(lat || 0);
+        const latCells = Math.round(lat / dLat);
+        const lngCells = Math.round(lng / dLng);
+        const snappedLat = latCells * dLat;
+        const snappedLng = lngCells * dLng;
+        return { lat: +snappedLat.toFixed(6), lng: +snappedLng.toFixed(6) };
+      }
+      function gridCellId(lat, lng, gridMeters = 10) {
+        const s = snapToGrid(lat, lng, gridMeters);
+        return `${s.lat.toFixed(6)},${s.lng.toFixed(6)}`;
+      }
+      function haversineMeters(lat1, lon1, lat2, lon2) {
+        const R = 6371000;
+        const toRad = (v) => (v * Math.PI) / 180;
+        const dLat = toRad(lat2 - lat1);
+        const dLon = toRad(lon2 - lon1);
+        const a =
+          Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+          Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+        return 2 * R * Math.asin(Math.sqrt(a));
+      }
+      function now() {
+        return Date.now();
+      }
+      function secondsSince(ts) {
+        return (now() - ts) / 1000;
+      }
+      function minutesFromNow(min) {
+        return now() + min * 60 * 1000;
+      }
+
+      // Random helpers with deterministic seeding per cell (simple hash)
+      function simpleHash(str) {
+        let h = 2166136261 >>> 0;
+        for (let i = 0; i < str.length; i++) {
+          h ^= str.charCodeAt(i);
+          h = Math.imul(h, 16777619);
+        }
+        return h >>> 0;
+      }
+      function seededRandom(seed) {
+        // Mulberry32
+        let t = seed + 0x6D2B79F5;
+        return function () {
+          t += 0x6D2B79F5;
+          let r = Math.imul(t ^ (t >>> 15), 1 | t);
+          r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+          return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+        };
+      }
+
+      // ------------------------------
+      // WebSim room init
+      // ------------------------------
+      const room = new WebsimSocket();
+
+      // ------------------------------
+      // Persistent Player Profile (record)
+      // ------------------------------
+      async function getOrCreatePlayerProfile() {
+        const currentUser = await window.websim.getCurrentUser();
+        const username = currentUser.username;
+        // Try to load profile_v1 by username
+        const all = room.collection("profile_v1").filter({ username }).getList();
+        if (all && all.length > 0) {
+          return all[0];
+        }
+        // Create basic inventory with some starting food and wood
+        const newProfile = await room.collection("profile_v1").create({
+          // username auto-added, but storing for filter convenience
+          startingVersion: 1,
+          level: GAME.player.baseStats.level,
+          xp: GAME.player.baseStats.xp,
+          maxHP: GAME.player.baseStats.maxHP,
+          attack: GAME.player.baseStats.attack,
+          defense: GAME.player.baseStats.defense,
+          inventory: {
+            food: 25,
+            wood: 0,
+            stone: 0,
+            ore: 0,
+            herb: 0,
+            gold: 0
+          }
+        });
+        return newProfile;
+      }
+
+      function clampInventory(inv) {
+        // Enforce non-negative integers and stack limit
+        const out = { ...inv };
+        for (const k of Object.keys(out)) {
+          out[k] = Math.max(0, Math.min(GAME.player.inventory.stackLimitPerItem, Math.floor(out[k] || 0)));
+        }
+        return out;
+      }
+
+      // ------------------------------
+      // React Components
+      // ------------------------------
+      function useRoomSync() {
+        const [initialized, setInitialized] = useState(false);
+        const [presence, setPresence] = useState({});
+        const [roomState, setRoomState] = useState({});
+
+        useEffect(() => {
+          let unsubPresence = () => {};
+          let unsubRoom = () => {};
+          (async () => {
+            await room.initialize();
+            setPresence({ ...room.presence });
+            setRoomState({ ...room.roomState });
+            unsubPresence = room.subscribePresence(() => setPresence({ ...room.presence }));
+            unsubRoom = room.subscribeRoomState(() => setRoomState({ ...room.roomState }));
+            setInitialized(true);
+          })();
+          return () => {
+            unsubPresence();
+            unsubRoom();
+          };
+        }, []);
+        return { initialized, presence, roomState, setRoomState };
+      }
+
+      function usePlayerProfile() {
+        const [profile, setProfile] = useState(null);
+        useEffect(() => {
+          let unsub = () => {};
+          (async () => {
+            const p = await getOrCreatePlayerProfile();
+            setProfile(p);
+            unsub = room.collection("profile_v1").filter({ username: p.username }).subscribe((list) => {
+              if (list && list[0]) setProfile(list[0]);
+            });
+          })();
+          return () => unsub();
+        }, []);
+        const updateProfile = async (patch) => {
+          if (!profile) return;
+          await room.collection("profile_v1").update(profile.id, patch);
+        };
+        return { profile, updateProfile };
+      }
+
+      function Header({ profile, myPresence }) {
+        const food = profile?.inventory?.food ?? 0;
+        return (
+          <div className="header">
+            <div className="title">{GAME.title}</div>
+            <div className="stats">
+              <span>Lvl {profile?.level ?? 1}</span>
+              <span>XP {profile?.xp ?? 0}</span>
+              <span>HP {myPresence?.hp ?? GAME.player.baseStats.maxHP}/{profile?.maxHP ?? GAME.player.baseStats.maxHP}</span>
+              <span>Food {food}</span>
+            </div>
+          </div>
+        );
+      }
+
+      function ChatPanel() {
+        const [message, setMessage] = useState("");
+        const [tab, setTab] = useState("local"); // only local implemented
+        const [messages, setMessages] = useState([]);
+        const coll = useMemo(() => room.collection("message_v1").filter({ tab }), [tab]);
+
+        useEffect(() => {
+          const unsub = coll.subscribe((list) => setMessages(list.slice().reverse().slice(0, 50))); // newest first
+          return () => unsub();
+        }, [coll]);
+
+        const send = async () => {
+          if (!message.trim()) return;
+          await room.collection("message_v1").create({ tab, text: message.trim() });
+          setMessage("");
+        };
+
+        return (
+          <div className="panel chat">
+            <div className="tabs">
+              {["local", "global", "guild"].map((t) => (
+                <button key={t} className={t === tab ? "active" : ""} onClick={() => setTab(t)}>
+                  {t}
+                </button>
+              ))}
+            </div>
+            <div className="messages">
+              {messages.map((m) => (
+                <div key={m.id} className="msg">
+                  <img
+                    className="avatar"
+                    src={`https://images.websim.com/avatar/${m.username}`}
+                    alt={m.username}
+                  />
+                  <div className="bubble">
+                    <div className="meta">
+                      <b>{m.username}</b> <span>{new Date(m.created_at).toLocaleTimeString()}</span>
+                    </div>
+                    <div className="text">{m.text}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="inputRow">
+              <input
+                value={message}
+                placeholder="Say something..."
+                onChange={(e) => setMessage(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && send()}
+              />
+              <button onClick={send}>Send</button>
+            </div>
+          </div>
+        );
+      }
+
+      function InventoryPanel({ profile, updateProfile }) {
+        const inv = profile?.inventory || {};
+        const entries = Object.entries(inv);
+        return (
+          <div className="panel inventory">
+            <h3>Inventory</h3>
+            <div className="grid">
+              {entries.map(([k, v]) => (
+                <div className="slot" key={k}>
+                  <div className="itemName">{k}</div>
+                  <div className="qty">{v}</div>
+                </div>
+              ))}
+            </div>
+            <button
+              className="secondary"
+              onClick={async () => {
+                // quick heal using food if any
+                if (!profile) return;
+                const food = inv.food || 0;
+                if (food <= 0) return;
+                await updateProfile({ inventory: { ...inv, food: food - 1 } });
+                room.updatePresence({ hp: Math.min((room.presence[room.clientId]?.hp ?? 0) + 10, profile.maxHP) });
+              }}
+            >
+              Eat Food (+10 HP)
+            </button>
+          </div>
+        );
+      }
+
+      function CraftingPanel({ profile, updateProfile }) {
+        const [status, setStatus] = useState("");
+        const recipes = [
+          { id: "ironSword", inputs: { ore: 10, wood: 2 }, output: "ironSword" },
+          { id: "leatherArmor", inputs: { hide: 8 }, output: "leatherArmor" },
+          { id: "healthPotion", inputs: { herb: 5, water: 1 }, output: "healthPotion" }
+        ];
+        const craft = async (r) => {
+          if (!profile) return;
+          const inv = { ...(profile.inventory || {}) };
+          for (const k in r.inputs) {
+            if ((inv[k] || 0) < r.inputs[k]) {
+              setStatus(`Missing ${k}`);
+              return;
+            }
+          }
+          for (const k in r.inputs) inv[k] -= r.inputs[k];
+          inv[r.output] = (inv[r.output] || 0) + 1;
+          await updateProfile({ inventory: clampInventory(inv) });
+          setStatus(`Crafted ${r.output}!`);
+          setTimeout(() => setStatus(""), 1500);
+        };
+        return (
+          <div className="panel crafting">
+            <h3>Crafting</h3>
+            <div className="recipes">
+              {recipes.map((r) => (
+                <div className="recipe" key={r.id}>
+                  <div className="name">{r.id}</div>
+                  <div className="inputs">
+                    {Object.entries(r.inputs).map(([k, v]) => (
+                      <span key={k}>{k}:{v}</span>
+                    ))}
+                  </div>
+                  <button onClick={() => craft(r)}>Craft</button>
+                </div>
+              ))}
+            </div>
+            <div className="status">{status}</div>
+          </div>
+        );
+      }
+
+      function MapView({ profile, updateProfile, presence, roomState }) {
+        const mapRef = useRef(null);
+        const leafletRef = useRef(null);
+        const [center, setCenter] = useState({ lat: 37.7749, lng: -122.4194 });
+        const [myClient, setMyClient] = useState(null);
+        const [selected, setSelected] = useState(null); // selected entity info
+
+        const myPresence = presence[room.clientId] || {};
+        useEffect(() => {
+          // On mount, try geolocation
+          if (navigator.geolocation) {
+            navigator.geolocation.getCurrentPosition(
+              (pos) => {
+                const { latitude, longitude } = pos.coords;
+                setCenter({ lat: latitude, lng: longitude });
+                // Set presence position
+                room.updatePresence({
+                  lat: latitude,
+                  lng: longitude,
+                  hp: profile?.maxHP || GAME.player.baseStats.maxHP
+                });
+              },
+              () => {},
+              { enableHighAccuracy: true, maximumAge: 2000, timeout: 5000 }
+            );
+          }
+        }, []);
+
+        useEffect(() => {
+          // Initialize Leaflet
+          if (!mapRef.current) return;
+          leafletRef.current = L.map(mapRef.current, {
+            minZoom: GAME.map.minZoom,
+            maxZoom: GAME.map.maxZoom,
+            zoomControl: false
+          }).setView([center.lat, center.lng], GAME.map.defaultZoom);
+
+          L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+            attribution: "&copy; OpenStreetMap contributors"
+          }).addTo(leafletRef.current);
+
+          L.control.zoom({ position: "bottomright" }).addTo(leafletRef.current);
+
+          // Click to jump (desktop mode)
+          leafletRef.current.on("click", async (e) => {
+            await handleJump(e.latlng);
+          });
+
+          // Moveend: spawn/update entities in view
+          const onMoveEnd = () => {
+            const bounds = leafletRef.current.getBounds();
+            spawnViewEntities(bounds);
+          };
+          leafletRef.current.on("moveend", onMoveEnd);
+          onMoveEnd();
+
+          return () => {
+            leafletRef.current.off();
+            leafletRef.current.remove();
+            leafletRef.current = null;
+          };
+        }, []);
+
+        useEffect(() => {
+          // Update map center if presence moved (mobile GPS)
+          if (leafletRef.current && myPresence.lat && myPresence.lng) {
+            // don't re-center too aggressively; only if user is near edge
+            const map = leafletRef.current;
+            const c = map.getCenter();
+            if (haversineMeters(c.lat, c.lng, myPresence.lat, myPresence.lng) > 100) {
+              map.panTo([myPresence.lat, myPresence.lng], { animate: true });
+            }
+          }
+        }, [myPresence.lat, myPresence.lng]);
+
+        useEffect(() => {
+          // Track my peer
+          if (room.peers && room.clientId && room.peers[room.clientId]) {
+            setMyClient(room.peers[room.clientId]);
+          }
+        }, [presence]);
+
+        // Render peers and entities
+        useEffect(() => {
+          if (!leafletRef.current) return;
+          // Clear existing player layer and rebuild
+          if (!leafletRef.current._playerLayer) {
+            leafletRef.current._playerLayer = L.layerGroup().addTo(leafletRef.current);
+          }
+          const layer = leafletRef.current._playerLayer;
+          layer.clearLayers();
+          Object.entries(presence).forEach(([clientId, p]) => {
+            if (!p.lat || !p.lng) return;
+            const peer = room.peers[clientId];
+            const icon = L.icon({
+              iconUrl: peer?.avatarUrl || `https://images.websim.com/avatar/${peer?.username || "anon"}`,
+              iconSize: [32, 32],
+              className: "avatarIcon"
+            });
+            const marker = L.marker([p.lat, p.lng], { icon }).addTo(layer);
+            marker.bindTooltip(peer?.username || "Player", { permanent: false });
+          });
+
+          // Entities layer (resources + monsters)
+          if (!leafletRef.current._entityLayer) {
+            leafletRef.current._entityLayer = L.layerGroup().addTo(leafletRef.current);
+          }
+          const eLayer = leafletRef.current._entityLayer;
+          eLayer.clearLayers();
+
+          const entities = room.roomState.entities || {};
+          const resources = entities.resources || {};
+          const monsters = entities.monsters || {};
+
+          // Resource markers
+          Object.entries(resources).forEach(([cellId, data]) => {
+            if (!data || data.state === "despawned") return;
+            const [lat, lng] = cellId.split(",").map(parseFloat);
+            const icon = L.divIcon({
+              className: "resourceIcon",
+              html: "🌲⛰️⛏️🌿".includes(data.type) ? data.type : ({
+                wood: "🌲",
+                stone: "🪨",
+                ore: "⛏️",
+                herb: "🌿"
+              }[data.type] || "📦"),
+              iconSize: [24, 24]
+            });
+            const m = L.marker([lat, lng], { icon }).addTo(eLayer);
+            m.on("click", () => tryGather(cellId, { lat, lng }, data));
+            m.bindTooltip(`${data.type} (G)`, { permanent: false });
+          });
+
+          // Monster markers
+          Object.entries(monsters).forEach(([cellId, data]) => {
+            if (!data || data.state === "dead") return;
+            const [lat, lng] = cellId.split(",").map(parseFloat);
+            const icon = L.divIcon({ className: "monsterIcon", html: "👹", iconSize: [24, 24] });
+            const m = L.marker([lat, lng], { icon }).addTo(eLayer);
+            m.on("click", () => setSelected({ type: "monster", cellId, lat, lng, data }));
+            m.bindTooltip(`${data.monsterId} HP:${data.hp}`, { permanent: false });
+          });
+        }, [presence, roomState]);
+
+        async function handleJump(latlng) {
+          if (!profile) return;
+          // Check cooldown
+          const lastJumpAt = myPresence.lastJumpAt || 0;
+          const cd = GAME.player.desktopJump.cooldownSec - Math.floor(secondsSince(lastJumpAt));
+          if (cd > 0) {
+            notify(`Jump cooling down: ${cd}s`);
+            return;
+          }
+          // Check cost
+          const inv = profile.inventory || {};
+          const food = inv.food || 0;
+          if (food < GAME.player.desktopJump.cost.food) {
+            notify("Not enough food to jump");
+            return;
+          }
+          // Spend and jump
+          await updateProfile({
+            inventory: { ...inv, food: food - GAME.player.desktopJump.cost.food }
+          });
+          room.updatePresence({
+            lat: latlng.lat,
+            lng: latlng.lng,
+            lastJumpAt: now()
+          });
+          // generate entities in new view
+          spawnViewEntities(leafletRef.current.getBounds());
+        }
+
+        function notify(text) {
+          room.send({ type: "toast", text, echo: true });
+        }
+
+        // Deterministic spawn for cells in view; stored in roomState.entities
+        function spawnViewEntities(bounds) {
+          const grid = GAME.map.gridCellSizeMeters;
+          const sw = bounds.getSouthWest();
+          const ne = bounds.getNorthEast();
+
+          const dLat = grid / metersPerDegLat;
+          const latStepCount = Math.max(1, Math.floor((ne.lat - sw.lat) / dLat));
+          for (let i = 0; i <= latStepCount; i++) {
+            const lat = sw.lat + i * dLat;
+            const dLng = grid / metersPerDegLon(lat);
+            const lngStepCount = Math.max(1, Math.floor((ne.lng - sw.lng) / dLng));
+            for (let j = 0; j <= lngStepCount; j++) {
+              const lng = sw.lng + j * dLng;
+              const snapped = snapToGrid(lat, lng, grid);
+              const id = gridCellId(snapped.lat, snapped.lng, grid);
+
+              const entities = room.roomState.entities || {};
+              const resources = entities.resources || {};
+              const monsters = entities.monsters || {};
+
+              if (!resources[id] && !monsters[id]) {
+                // decide spawn by seed
+                const rng = seededRandom(simpleHash(id));
+                const roll = rng();
+                if (roll < 0.10) {
+                  // 10% chance monster
+                  const m = GAME.monsters[Math.floor(rng() * GAME.monsters.length)];
+                  room.updateRoomState({
+                    entities: {
+                      monsters: {
+                        [id]: {
+                          state: "alive",
+                          monsterId: m.id,
+                          hp: m.hp
+                        }
+                      }
+                    }
+                  });
+                } else if (roll < 0.35) {
+                  // 25% chance resource
+                  const r = GAME.resources[Math.floor(rng() * GAME.resources.length)];
+                  room.updateRoomState({
+                    entities: {
+                      resources: {
+                        [id]: {
+                          state: "ready",
+                          type: r.id,
+                          respawnAt: 0
+                        }
+                      }
+                    }
+                  });
+                }
+              } else {
+                // handle respawns for resources
+                const res = resources[id];
+                if (res && res.state === "depleted" && res.respawnAt && now() > res.respawnAt) {
+                  room.updateRoomState({
+                    entities: {
+                      resources: {
+                        [id]: {
+                          ...res,
+                          state: "ready",
+                          respawnAt: 0
+                        }
+                      }
+                    }
+                  });
+                }
+              }
+            }
+          }
+        }
+
+        async function tryGather(cellId, pos, data) {
+          if (!profile) return;
+          if (!myPresence.lat || !myPresence.lng) return;
+          const dist = haversineMeters(myPresence.lat, myPresence.lng, pos.lat, pos.lng);
+          if (dist > GAME.map.interactionRadiusMeters) {
+            notify("Move closer to gather");
+            return;
+          }
+          // If already depleted, ignore
+          const res = (room.roomState.entities?.resources || {})[cellId];
+          if (!res || res.state !== "ready") return;
+
+          const type = data.type;
+          const inv = { ...(profile.inventory || {}) };
+          inv[type] = (inv[type] || 0) + 1;
+          await updateProfile({ inventory: clampInventory(inv), xp: (profile.xp || 0) + 5 });
+          // Deplete and set respawn
+          const respawnMin =
+            (GAME.resources.find((r) => r.id === type)?.respawnMinutes) || 30;
+          room.updateRoomState({
+            entities: {
+              resources: {
+                [cellId]: {
+                  ...res,
+                  state: "depleted",
+                  respawnAt: minutesFromNow(respawnMin)
+                }
+              }
+            }
+          });
+          notify(`Gathered ${type}`);
+        }
+
+        async function engageCombat(mon) {
+          setSelected(null);
+          if (!profile) return;
+          const { cellId, data } = mon;
+          const myHP = myPresence.hp ?? profile.maxHP;
+          if (!myPresence.lat || !myPresence.lng) return;
+
+          // simple one-round resolution
+          const meAtk = profile.attack;
+          const dmgToMonster = Math.max(1, meAtk + Math.floor(Math.random() * 5));
+          const newMonsterHP = Math.max(0, (data.hp || 0) - dmgToMonster);
+
+          let dmgToMe = Math.max(0, (Math.floor(Math.random() * 10) + 5) - profile.defense);
+          const nextMyHP = Math.max(0, myHP - dmgToMe);
+
+          // Update monster state
+          if (newMonsterHP <= 0) {
+            room.updateRoomState({
+              entities: {
+                monsters: {
+                  [cellId]: {
+                    ...data,
+                    state: "dead",
+                    hp: 0
+                  }
+                }
+              }
+            });
+            // reward gold
+            const inv = { ...(profile.inventory || {}) };
+            inv.gold = (inv.gold || 0) + 5;
+            await updateProfile({ inventory: inv, xp: (profile.xp || 0) + 20 });
+            notify("Monster defeated! +5 gold, +20 XP");
+          } else {
+            room.updateRoomState({
+              entities: {
+                monsters: {
+                  [cellId]: { ...data, hp: newMonsterHP }
+                }
+              }
+            });
+          }
+
+          // Update my HP in presence
+          room.updatePresence({ hp: nextMyHP });
+          if (nextMyHP <= 0) {
+            notify("You died! Respawning...");
+            // respawn near current location
+            setTimeout(() => {
+              const baseHP = profile.maxHP || GAME.player.baseStats.maxHP;
+              room.updatePresence({ hp: baseHP });
+            }, 2000);
+          }
+        }
+
+        return (
+          <div className="mapWrap">
+            <div className="mapToolbar">
+              <button
+                onClick={() => {
+                  if (leafletRef.current && myPresence.lat && myPresence.lng) {
+                    leafletRef.current.panTo([myPresence.lat, myPresence.lng]);
+                  }
+                }}
+              >
+                Center on me
+              </button>
+              <span>Interact radius: {GAME.map.interactionRadiusMeters}m</span>
+            </div>
+            <div ref={mapRef} id="map"></div>
+
+            {selected?.type === "monster" && (
+              <div className="dialog">
+                <div className="dialogInner">
+                  <h3>{selected.data.monsterId.toUpperCase()}</h3>
+                  <div>HP: {selected.data.hp}</div>
+                  <div className="dialogActions">
+                    <button onClick={() => engageCombat(selected)}>Attack</button>
+                    <button className="secondary" onClick={() => setSelected(null)}>
+                      Close
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      function App() {
+        const { initialized, presence, roomState } = useRoomSync();
+        const { profile, updateProfile } = usePlayerProfile();
+        const [view, setView] = useState("map");
+
+        // Toasts via events
+        const [toasts, setToasts] = useState([]);
+        useEffect(() => {
+          room.onmessage = (event) => {
+            const data = event.data;
+            if (data.type === "toast") {
+              setToasts((t) => [...t, { id: Math.random(), text: data.text }]);
+              setTimeout(() => {
+                setToasts((t) => t.slice(1));
+              }, 2000);
+            }
+          };
+        }, []);
+
+        // Set initial presence details once profile is ready
+        useEffect(() => {
+          if (!initialized || !profile) return;
+          const my = room.presence[room.clientId] || {};
+          if (my.hp == null) {
+            room.updatePresence({ hp: profile.maxHP || GAME.player.baseStats.maxHP });
+          }
+        }, [initialized, profile]);
+
+        // Layout
+        const myPresence = presence[room.clientId] || {};
+
+        return (
+          <div className="app">
+            <Header profile={profile} myPresence={myPresence} />
+            <div className="main">
+              <div className="left">
+                <div className="tabs">
+                  <button className={view === "map" ? "active" : ""} onClick={() => setView("map")}>
+                    Map
+                  </button>
+                  <button
+                    className={view === "inventory" ? "active" : ""}
+                    onClick={() => setView("inventory")}
+                  >
+                    Inventory
+                  </button>
+                  <button
+                    className={view === "crafting" ? "active" : ""}
+                    onClick={() => setView("crafting")}
+                  >
+                    Crafting
+                  </button>
+                </div>
+                <div className="content">
+                  {view === "map" && (
+                    <MapView
+                      profile={profile}
+                      updateProfile={updateProfile}
+                      presence={presence}
+                      roomState={roomState}
+                    />
+                  )}
+                  {view === "inventory" && (
+                    <InventoryPanel profile={profile} updateProfile={updateProfile} />
+                  )}
+                  {view === "crafting" && (
+                    <CraftingPanel profile={profile} updateProfile={updateProfile} />
+                  )}
+                </div>
+              </div>
+              <div className="right">
+                <ChatPanel />
+              </div>
+            </div>
+
+            <div className="toastWrap">
+              {toasts.map((t) => (
+                <div key={t.id} className="toast">
+                  {t.text}
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      }
+
+      ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+    </script>
+  <script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"4c6229722a6346bc8eb5cb0e5eae5d41","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+</body>
+</html>
+
